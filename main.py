@@ -2,6 +2,8 @@ import sys
 from collections.abc import Sequence
 from pathlib import Path
 
+from kaku.document import TextDocument
+
 from PySide6.QtCore import QRect, QSize, Qt
 from PySide6.QtGui import (
     QAction,
@@ -54,6 +56,7 @@ class CodeEditor(QTextEdit):
         self._line_number_area = LineNumberArea(self)
         self._fixing_line_height = False
         self._line_height_override: int | None = None
+        self._text_document = TextDocument(self.document())
 
         self.document().blockCountChanged.connect(self._update_line_number_area_width)
         self.document().contentsChanged.connect(self._fix_all_line_heights)
@@ -61,6 +64,10 @@ class CodeEditor(QTextEdit):
         self.document().contentsChanged.connect(self._line_number_area.update)
 
         self._update_line_number_area_width()
+
+    @property
+    def text_document(self) -> TextDocument:
+        return self._text_document
 
     def setFont(self, font: QFont | str | Sequence[str]):
         super().setFont(font)
@@ -334,7 +341,7 @@ class KakuEditor(QMainWindow):
         if not self._confirm_discard():
             return
         path, _ = QFileDialog.getOpenFileName(
-            self, "ファイルを開く", "", "テキストファイル (*.txt);;すべてのファイル (*)"
+            self, "ファイルを開く", "", "すべてのファイル (*)"
         )
         if not path:
             return
@@ -343,6 +350,9 @@ class KakuEditor(QMainWindow):
     def _load_file(self, path: Path):
         try:
             text = path.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            QMessageBox.critical(self, "エラー", f"テキストファイルではないため開けません:\n{path.name}")
+            return
         except OSError as e:
             QMessageBox.critical(self, "エラー", f"ファイルを開けませんでした:\n{e}")
             return
