@@ -3,11 +3,11 @@ from collections.abc import Sequence
 from pathlib import Path
 
 from kaku.document import TextDocument
+from kaku.highlighter import EDITOR_BG, EDITOR_FG, LINE_NUMBER_BG, LINE_NUMBER_FG, PythonHighlighter
 
 from PySide6.QtCore import QRect, QSize, Qt
 from PySide6.QtGui import (
     QAction,
-    QColor,
     QFont,
     QFontDatabase,
     QFontMetrics,
@@ -30,8 +30,6 @@ from PySide6.QtWidgets import (
 
 _DEFAULT_FONT_SIZE = 13
 
-_LINE_NUMBER_BG = QColor("#f0f0f0")
-_LINE_NUMBER_FG = QColor("#888888")
 _LINE_NUMBER_PADDING = 8  # 右側パディング (px)
 
 
@@ -57,6 +55,7 @@ class CodeEditor(QTextEdit):
         self._fixing_line_height = False
         self._line_height_override: int | None = None
         self._text_document = TextDocument(self.document())
+        self._highlighter = PythonHighlighter(self._text_document)
 
         self.document().blockCountChanged.connect(self._update_line_number_area_width)
         self.document().contentsChanged.connect(self._fix_all_line_heights)
@@ -120,8 +119,8 @@ class CodeEditor(QTextEdit):
 
     def paint_line_numbers(self, event):
         painter = QPainter(self._line_number_area)
-        painter.fillRect(event.rect(), _LINE_NUMBER_BG)
-        painter.setPen(_LINE_NUMBER_FG)
+        painter.fillRect(event.rect(), LINE_NUMBER_BG)
+        painter.setPen(LINE_NUMBER_FG)
 
         doc_layout = self.document().documentLayout()
         scroll_y = self.verticalScrollBar().value()
@@ -163,6 +162,10 @@ class KakuEditor(QMainWindow):
         self._editor = CodeEditor()
         self._editor.setFont(self._default_font())
         self._editor.setTabStopDistance(40)
+        palette = self._editor.palette()
+        palette.setColor(palette.ColorRole.Base, EDITOR_BG)
+        palette.setColor(palette.ColorRole.Text, EDITOR_FG)
+        self._editor.setPalette(palette)
         self.setCentralWidget(self._editor)
 
         self._editor.textChanged.connect(self._on_text_changed)
