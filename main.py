@@ -4,16 +4,19 @@ from pathlib import Path
 
 from kaku.document import TextDocument
 from kaku.highlighter import EDITOR_BG, EDITOR_FG, LINE_NUMBER_BG, LINE_NUMBER_FG, PythonHighlighter
+from kaku.lsp import LspClient
 
-from PySide6.QtCore import QRect, QSize, Qt
+from PySide6.QtCore import QRect, QSize, Qt, QTimer
 from PySide6.QtGui import (
     QAction,
+    QColor,
     QFont,
     QFontDatabase,
     QFontMetrics,
     QKeySequence,
     QPainter,
     QTextBlockFormat,
+    QTextCharFormat,
     QTextCursor,
 )
 from PySide6.QtWidgets import (
@@ -25,6 +28,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QStatusBar,
     QTextEdit,
+    QToolTip,
     QWidget,
 )
 
@@ -56,6 +60,8 @@ class CodeEditor(QTextEdit):
         self._line_height_override: int | None = None
         self._text_document = TextDocument(self.document())
         self._highlighter = PythonHighlighter(self._text_document)
+        self._diagnostics: list[dict] = []
+        self.setMouseTracking(True)
 
         self.document().blockCountChanged.connect(self._update_line_number_area_width)
         self.document().contentsChanged.connect(self._fix_all_line_heights)
@@ -117,6 +123,66 @@ class CodeEditor(QTextEdit):
             QRect(cr.left(), cr.top(), self.line_number_area_width(), cr.height())
         )
 
+    def mouseMoveEvent(self, event) -> None:
+        super().mouseMoveEvent(event)
+        doc = self.document()
+        pos = self.cursorForPosition(event.position().toPoint()).position()
+        for diag in self._diagnostics:
+            r = diag.get("range", {})
+            start = r.get("start", {})
+            end = r.get("end", {})
+            start_block = doc.findBlockByNumber(start.get("line", 0))
+            end_block = doc.findBlockByNumber(end.get("line", 0))
+            if not start_block.isValid() or not end_block.isValid():
+                continue
+            start_pos = start_block.position() + start.get("character", 0)
+            end_pos = end_block.position() + end.get("character", 0)
+            if start_pos <= pos <= end_pos:
+                code = diag.get("code", "")
+                message = diag.get("message", "")
+                text = f"[{code}] {message}" if code else message
+                QToolTip.showText(event.globalPosition().toPoint(), text, self)
+                return
+        QToolTip.hideText()
+
+    def set_diagnostics(self, diagnostics: list) -> None:
+        """LSP診断をwavy underlineでエディタに表示する。"""
+        self._diagnostics = diagnostics
+        _severity_colors = {
+            1: QColor("#d20f39"),  # Error   — Catppuccin Red
+            2: QColor("#df8e1d"),  # Warning — Catppuccin Yellow
+            3: QColor("#1e66f5"),  # Info    — Catppuccin Blue
+            4: QColor("#8c8fa1"),  # Hint    — Catppuccin Overlay1
+        }
+        doc = self.document()
+        selections: list[QTextEdit.ExtraSelection] = []
+        for diag in diagnostics:
+            r = diag.get("range", {})
+            start = r.get("start", {})
+            end = r.get("end", {})
+            start_block = doc.findBlockByNumber(start.get("line", 0))
+            end_block = doc.findBlockByNumber(end.get("line", 0))
+            if not start_block.isValid() or not end_block.isValid():
+                continue
+
+            cursor = QTextCursor(start_block)
+            cursor.setPosition(start_block.position() + start.get("character", 0))
+            cursor.setPosition(
+                end_block.position() + end.get("character", 0),
+                QTextCursor.MoveMode.KeepAnchor,
+            )
+
+            fmt = QTextCharFormat()
+            fmt.setUnderlineStyle(QTextCharFormat.UnderlineStyle.WaveUnderline)
+            fmt.setUnderlineColor(_severity_colors.get(diag.get("severity", 1), _severity_colors[1]))
+
+            sel = QTextEdit.ExtraSelection()
+            sel.cursor = cursor
+            sel.format = fmt
+            selections.append(sel)
+
+        self.setExtraSelections(selections)
+
     def paint_line_numbers(self, event):
         painter = QPainter(self._line_number_area)
         painter.fillRect(event.rect(), LINE_NUMBER_BG)
@@ -152,9 +218,24 @@ class KakuEditor(QMainWindow):
         self._file_path: Path | None = None
         self._is_modified = False
 
+        # LSP
+        self._lsp = LspClient()
+        self._lsp_active = False
+        self._lsp_uri: str | None = None
+        self._lsp_version = 1
+        self._lsp_timer = QTimer(self)
+        self._lsp_timer.setSingleShot(True)
+        self._lsp_timer.setInterval(500)
+        self._lsp_timer.timeout.connect(self._send_lsp_change)
+        self._lsp.diagnostics_received.connect(self._on_lsp_diagnostics)
+
         self._setup_ui()
         self._setup_menu()
         self._update_title()
+
+        self._lsp_active = self._lsp.start(["ruff", "server"])
+        if self._lsp_active:
+            self._lsp.initialize()
 
     def _setup_ui(self):
         self.setMinimumSize(800, 600)
@@ -302,6 +383,17 @@ class KakuEditor(QMainWindow):
         if not self._is_modified:
             self._is_modified = True
             self._update_title()
+        if self._lsp_active and self._lsp_uri:
+            self._lsp_timer.start()
+
+    def _send_lsp_change(self) -> None:
+        if self._lsp_uri:
+            self._lsp_version += 1
+            self._lsp.did_change(self._lsp_uri, self._editor.toPlainText(), self._lsp_version)
+
+    def _on_lsp_diagnostics(self, uri: str, diagnostics: list) -> None:
+        if uri == self._lsp_uri:
+            self._editor.set_diagnostics(diagnostics)
 
     def _update_title(self):
         name = self._file_path.name if self._file_path else "無題"
@@ -335,7 +427,9 @@ class KakuEditor(QMainWindow):
     def _new_file(self):
         if not self._confirm_discard():
             return
+        self._close_lsp_document()
         self._editor.clear()
+        self._editor.set_diagnostics([])
         self._file_path = None
         self._is_modified = False
         self._update_title()
@@ -350,6 +444,12 @@ class KakuEditor(QMainWindow):
             return
         self._load_file(Path(path))
 
+    def _close_lsp_document(self) -> None:
+        if self._lsp_active and self._lsp_uri:
+            self._lsp_timer.stop()
+            self._lsp.did_close(self._lsp_uri)
+            self._lsp_uri = None
+
     def _load_file(self, path: Path):
         try:
             text = path.read_text(encoding="utf-8")
@@ -359,10 +459,15 @@ class KakuEditor(QMainWindow):
         except OSError as e:
             QMessageBox.critical(self, "エラー", f"ファイルを開けませんでした:\n{e}")
             return
+        self._close_lsp_document()
         self._editor.setPlainText(text)
         self._file_path = path
         self._is_modified = False
         self._update_title()
+        if self._lsp_active:
+            self._lsp_uri = path.as_uri()
+            self._lsp_version = 1
+            self._lsp.did_open(self._lsp_uri, text)
 
     def _save_file(self) -> bool:
         if self._file_path is None:
@@ -395,6 +500,7 @@ class KakuEditor(QMainWindow):
 
     def closeEvent(self, event):
         if self._confirm_discard():
+            self._lsp.stop()
             event.accept()
         else:
             event.ignore()
@@ -403,6 +509,7 @@ class KakuEditor(QMainWindow):
 def main():
     app = QApplication(sys.argv)
     app.setApplicationName("Kaku")
+    app.setStyleSheet("QToolTip { font-size: 13px; }")
 
     window = KakuEditor()
     window.show()
