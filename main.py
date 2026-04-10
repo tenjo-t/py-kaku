@@ -56,7 +56,6 @@ class CodeEditor(QTextEdit):
         self.setLineWrapMode(QTextEdit.LineWrapMode.NoWrap)
 
         self._line_number_area = LineNumberArea(self)
-        self._fixing_line_height = False
         self._line_height_override: int | None = None
         self._text_document = TextDocument(self.document())
         self._highlighter = PythonHighlighter(self._text_document)
@@ -64,7 +63,6 @@ class CodeEditor(QTextEdit):
         self.setMouseTracking(True)
 
         self.document().blockCountChanged.connect(self._update_line_number_area_width)
-        self.document().contentsChanged.connect(self._fix_all_line_heights)
         self.verticalScrollBar().valueChanged.connect(self._line_number_area.update)
         self.document().contentsChanged.connect(self._line_number_area.update)
 
@@ -96,17 +94,21 @@ class CodeEditor(QTextEdit):
         fmt.setLineHeight(float(self._line_height()), 2)  # 2 = FixedHeight
         return fmt
 
+    def setPlainText(self, text: str) -> None:
+        super().setPlainText(text)
+        # setPlainText はundoスタックをクリアする。その後 _fix_all_line_heights が
+        # エントリを作らないよう一時的にundoを無効化する（スタックは既に空）。
+        self.document().setUndoRedoEnabled(False)
+        self._fix_all_line_heights()
+        self.document().setUndoRedoEnabled(True)
+
     def _fix_all_line_heights(self):
-        if self._fixing_line_height:
-            return
-        self._fixing_line_height = True
         fmt = self._block_fmt()
         cursor = QTextCursor(self.document())
         cursor.beginEditBlock()
         cursor.select(QTextCursor.SelectionType.Document)
         cursor.setBlockFormat(fmt)
         cursor.endEditBlock()
-        self._fixing_line_height = False
 
     def line_number_area_width(self) -> int:
         digits = max(3, len(str(self.document().blockCount())))
@@ -294,37 +296,33 @@ class KakuEditor(QMainWindow):
         # 編集メニュー
         edit_menu = menu_bar.addMenu("編集(&E)")
 
-        undo_action = QAction("元に戻す(&Z)", self)
-        undo_action.setShortcut(QKeySequence.StandardKey.Undo)
+        # QTextEdit がこれらのショートカットをネイティブに処理するため、
+        # QAction にはショートカットを設定しない（設定するとmacOSメニューがチカチカする）。
+        undo_action = QAction("元に戻す", self)
         undo_action.triggered.connect(self._editor.undo)
         edit_menu.addAction(undo_action)
 
-        redo_action = QAction("やり直し(&Y)", self)
-        redo_action.setShortcut(QKeySequence.StandardKey.Redo)
+        redo_action = QAction("やり直し", self)
         redo_action.triggered.connect(self._editor.redo)
         edit_menu.addAction(redo_action)
 
         edit_menu.addSeparator()
 
-        cut_action = QAction("切り取り(&X)", self)
-        cut_action.setShortcut(QKeySequence.StandardKey.Cut)
+        cut_action = QAction("切り取り", self)
         cut_action.triggered.connect(self._editor.cut)
         edit_menu.addAction(cut_action)
 
-        copy_action = QAction("コピー(&C)", self)
-        copy_action.setShortcut(QKeySequence.StandardKey.Copy)
+        copy_action = QAction("コピー", self)
         copy_action.triggered.connect(self._editor.copy)
         edit_menu.addAction(copy_action)
 
-        paste_action = QAction("貼り付け(&V)", self)
-        paste_action.setShortcut(QKeySequence.StandardKey.Paste)
+        paste_action = QAction("貼り付け", self)
         paste_action.triggered.connect(self._editor.paste)
         edit_menu.addAction(paste_action)
 
         edit_menu.addSeparator()
 
-        select_all_action = QAction("すべて選択(&A)", self)
-        select_all_action.setShortcut(QKeySequence.StandardKey.SelectAll)
+        select_all_action = QAction("すべて選択", self)
         select_all_action.triggered.connect(self._editor.selectAll)
         edit_menu.addAction(select_all_action)
 
