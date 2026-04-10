@@ -3,7 +3,13 @@ from collections.abc import Sequence
 from pathlib import Path
 
 from kaku.document import TextDocument
-from kaku.highlighter import EDITOR_BG, EDITOR_FG, LINE_NUMBER_BG, LINE_NUMBER_FG, PythonHighlighter
+from kaku.highlighter import (
+    EDITOR_BG,
+    EDITOR_FG,
+    LINE_NUMBER_BG,
+    LINE_NUMBER_FG,
+    PythonHighlighter,
+)
 from kaku.lsp import LspClient
 
 from PySide6.QtCore import QRect, QSize, Qt, QTimer
@@ -18,6 +24,7 @@ from PySide6.QtGui import (
     QTextBlockFormat,
     QTextCharFormat,
     QTextCursor,
+    QTextFormat,
 )
 from PySide6.QtWidgets import (
     QApplication,
@@ -35,6 +42,9 @@ from PySide6.QtWidgets import (
 _DEFAULT_FONT_SIZE = 13
 
 _LINE_NUMBER_PADDING = 8  # 右側パディング (px)
+
+_AUTO_CLOSE = {"(": ")", "[": "]", "{": "}", '"': '"', "'": "'"}
+_CLOSE_CHARS = {")", "]", "}"}
 
 
 class LineNumberArea(QWidget):
@@ -60,11 +70,14 @@ class CodeEditor(QTextEdit):
         self._text_document = TextDocument(self.document())
         self._highlighter = PythonHighlighter(self._text_document)
         self._diagnostics: list[dict] = []
+        self._diagnostic_selections: list[QTextEdit.ExtraSelection] = []
         self.setMouseTracking(True)
 
         self.document().blockCountChanged.connect(self._update_line_number_area_width)
         self.verticalScrollBar().valueChanged.connect(self._line_number_area.update)
         self.document().contentsChanged.connect(self._line_number_area.update)
+        self.cursorPositionChanged.connect(self._update_extra_selections)
+        self.cursorPositionChanged.connect(self._line_number_area.update)
 
         self._update_line_number_area_width()
 
@@ -78,7 +91,11 @@ class CodeEditor(QTextEdit):
         self._fix_all_line_heights()
 
     def current_line_height(self) -> int:
-        return self._line_height_override if self._line_height_override is not None else self._line_height()
+        return (
+            self._line_height_override
+            if self._line_height_override is not None
+            else self._line_height()
+        )
 
     def set_line_height(self, value: int | None) -> None:
         self._line_height_override = value
@@ -125,6 +142,106 @@ class CodeEditor(QTextEdit):
             QRect(cr.left(), cr.top(), self.line_number_area_width(), cr.height())
         )
 
+    def keyPressEvent(self, event) -> None:
+        if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+            self._insert_newline_with_indent()
+        elif event.key() == Qt.Key.Key_Backspace:
+            self._smart_backspace(event)
+        elif event.text() in _AUTO_CLOSE:
+            self._insert_auto_close(event.text())
+        elif event.text() in _CLOSE_CHARS:
+            self._skip_or_insert_close(event.text(), event)
+        else:
+            super().keyPressEvent(event)
+
+    def _smart_backspace(self, event) -> None:
+        cursor = self.textCursor()
+        if not cursor.hasSelection():
+            pos = cursor.position()
+            doc = self.document()
+            col = cursor.positionInBlock()
+            text_before = cursor.block().text()[:col]
+
+            # ( | ) のようにカーソルが括弧ペアの中にある場合、両方を削除
+            if pos > 0 and pos < doc.characterCount() - 1:
+                prev_char = doc.characterAt(pos - 1)
+                next_char = doc.characterAt(pos)
+                if _AUTO_CLOSE.get(prev_char) == next_char:
+                    cursor.setPosition(pos - 1)
+                    cursor.setPosition(pos + 1, QTextCursor.MoveMode.KeepAnchor)
+                    cursor.removeSelectedText()
+                    self.setTextCursor(cursor)
+                    return
+
+            # 行頭からカーソルまで全てスペースの場合、タブ幅単位で削除
+            if text_before and text_before == " " * col:
+                n = (col - 1) % 4 + 1
+                for _ in range(n):
+                    cursor.movePosition(
+                        QTextCursor.MoveOperation.PreviousCharacter,
+                        QTextCursor.MoveMode.KeepAnchor,
+                    )
+                cursor.removeSelectedText()
+                self.setTextCursor(cursor)
+                return
+        super().keyPressEvent(event)
+
+    def _insert_newline_with_indent(self) -> None:
+        cursor = self.textCursor()
+        line = cursor.block().text()
+
+        # 現在行の先頭インデントを取得
+        indent = line[: len(line) - len(line.lstrip())]
+
+        # カーソル位置までの文字（末尾空白除去）が ':' で終わる場合、インデントを追加
+        text_before_cursor = line[: cursor.positionInBlock()].rstrip()
+        if text_before_cursor.endswith(":"):
+            indent += "    "
+
+        cursor.insertText("\n" + indent)
+        self.setTextCursor(cursor)
+
+    def _insert_auto_close(self, open_char: str) -> None:
+        close_char = _AUTO_CLOSE[open_char]
+        cursor = self.textCursor()
+        # クォートのように開閉が同じ文字の場合、次の文字が同じならスキップ
+        if open_char == close_char and not cursor.hasSelection():
+            doc = self.document()
+            pos = cursor.position()
+            if pos < doc.characterCount() - 1 and doc.characterAt(pos) == close_char:
+                cursor.movePosition(QTextCursor.MoveOperation.NextCharacter)
+                self.setTextCursor(cursor)
+                return
+        if cursor.hasSelection():
+            selected = cursor.selectedText()
+            cursor.insertText(open_char + selected + close_char)
+        else:
+            cursor.insertText(open_char + close_char)
+            cursor.movePosition(QTextCursor.MoveOperation.PreviousCharacter)
+            self.setTextCursor(cursor)
+
+    def _skip_or_insert_close(self, char: str, event) -> None:
+        cursor = self.textCursor()
+        if not cursor.hasSelection():
+            doc = self.document()
+            if cursor.position() < doc.characterCount() - 1:
+                if doc.characterAt(cursor.position()) == char:
+                    cursor.movePosition(QTextCursor.MoveOperation.NextCharacter)
+                    self.setTextCursor(cursor)
+                    return
+        super().keyPressEvent(event)
+
+    def _update_extra_selections(self) -> None:
+        # 現在行ハイライト
+        fmt = QTextCharFormat()
+        fmt.setBackground(QColor("#e8ebf2"))  # Base より少し暗い
+        fmt.setProperty(QTextFormat.Property.FullWidthSelection, True)
+        line_sel = QTextEdit.ExtraSelection()
+        line_sel.cursor = self.textCursor()
+        line_sel.cursor.clearSelection()
+        line_sel.format = fmt
+        self.setExtraSelections([line_sel] + self._diagnostic_selections)
+
     def mouseMoveEvent(self, event) -> None:
         super().mouseMoveEvent(event)
         doc = self.document()
@@ -156,6 +273,12 @@ class CodeEditor(QTextEdit):
             3: QColor("#1e66f5"),  # Info    — Catppuccin Blue
             4: QColor("#8c8fa1"),  # Hint    — Catppuccin Overlay1
         }
+        _severity_bg = {
+            1: QColor("#fce8ec"),  # Error bg
+            2: QColor("#fdf3dc"),  # Warning bg
+            3: QColor("#e4ecfe"),  # Info bg
+            4: QColor("#f0f1f4"),  # Hint bg
+        }
         doc = self.document()
         selections: list[QTextEdit.ExtraSelection] = []
         for diag in diagnostics:
@@ -174,26 +297,64 @@ class CodeEditor(QTextEdit):
                 QTextCursor.MoveMode.KeepAnchor,
             )
 
+            severity = diag.get("severity", 1)
             fmt = QTextCharFormat()
             fmt.setUnderlineStyle(QTextCharFormat.UnderlineStyle.WaveUnderline)
-            fmt.setUnderlineColor(_severity_colors.get(diag.get("severity", 1), _severity_colors[1]))
+            fmt.setUnderlineColor(_severity_colors.get(severity, _severity_colors[1]))
+            fmt.setBackground(_severity_bg.get(severity, _severity_bg[1]))
 
             sel = QTextEdit.ExtraSelection()
             sel.cursor = cursor
             sel.format = fmt
             selections.append(sel)
 
-        self.setExtraSelections(selections)
+        self._diagnostic_selections = selections
+        self._update_extra_selections()
+
+    def paintEvent(self, event) -> None:
+        super().paintEvent(event)
+        self._paint_indent_guides(event)
+
+    def _paint_indent_guides(self, event) -> None:
+        doc = self.document()
+        doc_layout = doc.documentLayout()
+        scroll_y = self.verticalScrollBar().value()
+        scroll_x = self.horizontalScrollBar().value()
+        doc_margin = doc.documentMargin()
+        tab_px = self.fontMetrics().horizontalAdvance(" ") * 4
+
+        painter = QPainter(self.viewport())
+        painter.setPen(QColor("#d0d3de"))  # Surface0 より少し明るい
+
+        block = doc.begin()
+        while block.isValid():
+            rect = doc_layout.blockBoundingRect(block)
+            top = rect.top() - scroll_y
+            bottom = rect.bottom() - scroll_y
+
+            if top > event.rect().bottom():
+                break
+
+            if bottom >= event.rect().top():
+                text = block.text()
+                if text.strip():  # 空行はスキップ
+                    indent = len(text) - len(text.lstrip(" "))
+                    for level in range(0, indent // 4):
+                        x = doc_margin - scroll_x + level * tab_px
+                        painter.drawLine(int(x), int(top), int(x), int(bottom) - 1)
+
+            block = block.next()
+        painter.end()
 
     def paint_line_numbers(self, event):
         painter = QPainter(self._line_number_area)
         painter.fillRect(event.rect(), LINE_NUMBER_BG)
-        painter.setPen(LINE_NUMBER_FG)
 
         doc_layout = self.document().documentLayout()
         scroll_y = self.verticalScrollBar().value()
         area_width = self._line_number_area.width()
         line_height = self._line_height()
+        current_block_num = self.textCursor().blockNumber()
 
         block = self.document().begin()
         while block.isValid():
@@ -203,6 +364,8 @@ class CodeEditor(QTextEdit):
             if top > event.rect().bottom():
                 break
             if bottom >= event.rect().top():
+                is_current = block.blockNumber() == current_block_num
+                painter.setPen(EDITOR_FG if is_current else LINE_NUMBER_FG)
                 painter.drawText(
                     0,
                     top,
@@ -351,12 +514,15 @@ class KakuEditor(QMainWindow):
     @staticmethod
     def _find_cjk_fixed_font() -> str | None:
         candidates = [
-            fam for fam in QFontDatabase.families()
+            fam
+            for fam in QFontDatabase.families()
             if QFontDatabase.isFixedPitch(fam)
-            and QFontDatabase.WritingSystem.Japanese in QFontDatabase.writingSystems(fam)
+            and QFontDatabase.WritingSystem.Japanese
+            in QFontDatabase.writingSystems(fam)
         ]
         if not candidates:
             return None
+
         # leading=0 を優先し、同じなら lineSpacing が小さいものを選ぶ
         def metrics_key(fam: str) -> tuple[int, int]:
             m = QFontMetrics(QFont(fam))
@@ -387,7 +553,9 @@ class KakuEditor(QMainWindow):
     def _send_lsp_change(self) -> None:
         if self._lsp_uri:
             self._lsp_version += 1
-            self._lsp.did_change(self._lsp_uri, self._editor.toPlainText(), self._lsp_version)
+            self._lsp.did_change(
+                self._lsp_uri, self._editor.toPlainText(), self._lsp_version
+            )
 
     def _on_lsp_diagnostics(self, uri: str, diagnostics: list) -> None:
         if uri == self._lsp_uri:
@@ -452,7 +620,9 @@ class KakuEditor(QMainWindow):
         try:
             text = path.read_text(encoding="utf-8")
         except UnicodeDecodeError:
-            QMessageBox.critical(self, "エラー", f"テキストファイルではないため開けません:\n{path.name}")
+            QMessageBox.critical(
+                self, "エラー", f"テキストファイルではないため開けません:\n{path.name}"
+            )
             return
         except OSError as e:
             QMessageBox.critical(self, "エラー", f"ファイルを開けませんでした:\n{e}")
@@ -477,7 +647,7 @@ class KakuEditor(QMainWindow):
             self,
             "名前を付けて保存",
             "",
-            "テキストファイル (*.txt);;すべてのファイル (*)",
+            "Pythonファイル (*.py);;テキストファイル (*.txt);;すべてのファイル (*)",
         )
         if not path:
             return False
@@ -511,6 +681,9 @@ def main():
 
     window = KakuEditor()
     window.show()
+
+    if len(sys.argv) > 1:
+        window._load_file(Path(sys.argv[1]).resolve())
 
     sys.exit(app.exec())
 
