@@ -11,12 +11,22 @@ class LspClient(QObject):
     """JSON-RPC over stdio LSP クライアント"""
 
     diagnostics_received = Signal(str, list)  # uri, diagnostics
+    completion_received = Signal(list)         # list[CompletionItem]
+    hover_received = Signal(dict)              # Hover result
+    resolve_received = Signal(dict)            # resolved CompletionItem
+    signature_help_received = Signal(dict)     # SignatureHelp result
 
     def __init__(self) -> None:
         super().__init__()
         self._process: subprocess.Popen[bytes] | None = None
         self._next_id = 1
         self._init_id: int | None = None
+        self._pending_completions: set[int] = set()
+        self._pending_hovers: set[int] = set()
+        self._pending_resolves: set[int] = set()
+        self._pending_sig_helps: set[int] = set()
+        self._last_hover_id: int | None = None
+        self._last_sig_help_id: int | None = None
 
     def start(self, command: list[str]) -> bool:
         """LSPサーバープロセスを起動する。コマンドが見つからない場合はFalseを返す。"""
@@ -71,7 +81,12 @@ class LspClient(QObject):
             "rootUri": root_uri,
             "capabilities": {
                 "textDocument": {
-                    "publishDiagnostics": {}
+                    "publishDiagnostics": {},
+                    "signatureHelp": {
+                        "signatureInformation": {
+                            "parameterInformation": {"labelOffsetSupport": True}
+                        }
+                    },
                 }
             },
         })
@@ -96,6 +111,33 @@ class LspClient(QObject):
         self._notify("textDocument/didClose", {
             "textDocument": {"uri": uri}
         })
+
+    def completion(self, uri: str, line: int, character: int) -> None:
+        req_id = self._request("textDocument/completion", {
+            "textDocument": {"uri": uri},
+            "position": {"line": line, "character": character},
+        })
+        self._pending_completions.add(req_id)
+
+    def resolve(self, item: dict) -> None:
+        req_id = self._request("completionItem/resolve", item)
+        self._pending_resolves.add(req_id)
+
+    def signature_help(self, uri: str, line: int, character: int) -> None:
+        req_id = self._request("textDocument/signatureHelp", {
+            "textDocument": {"uri": uri},
+            "position": {"line": line, "character": character},
+        })
+        self._pending_sig_helps.add(req_id)
+        self._last_sig_help_id = req_id
+
+    def hover(self, uri: str, line: int, character: int) -> None:
+        req_id = self._request("textDocument/hover", {
+            "textDocument": {"uri": uri},
+            "position": {"line": line, "character": character},
+        })
+        self._pending_hovers.add(req_id)
+        self._last_hover_id = req_id
 
     # ── 受信（バックグラウンドスレッド） ────────────────────────
 
@@ -125,9 +167,41 @@ class LspClient(QObject):
                 break
 
     def _dispatch(self, msg: dict) -> None:
+        msg_id = msg.get("id")
+
         # initialize のレスポンス → initialized を返す
-        if msg.get("id") == self._init_id and "result" in msg:
+        if msg_id == self._init_id and "result" in msg:
             self._notify("initialized", {})
+            return
+
+        # completion レスポンス
+        if msg_id in self._pending_completions and "result" in msg:
+            self._pending_completions.discard(msg_id)
+            result = msg["result"] or []
+            if isinstance(result, dict):
+                result = result.get("items", [])
+            self.completion_received.emit(result)
+            return
+
+        # resolve レスポンス
+        if msg_id in self._pending_resolves and "result" in msg:
+            self._pending_resolves.discard(msg_id)
+            if msg["result"]:
+                self.resolve_received.emit(msg["result"])
+            return
+
+        # signature help レスポンス（最新リクエスト以外は破棄）
+        if msg_id in self._pending_sig_helps and "result" in msg:
+            self._pending_sig_helps.discard(msg_id)
+            if msg_id == self._last_sig_help_id:
+                self.signature_help_received.emit(msg["result"] or {})
+            return
+
+        # hover レスポンス（最新リクエスト以外は破棄）
+        if msg_id in self._pending_hovers and "result" in msg:
+            self._pending_hovers.discard(msg_id)
+            if msg_id == self._last_hover_id and msg["result"]:
+                self.hover_received.emit(msg["result"])
             return
 
         method = msg.get("method", "")
