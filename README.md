@@ -16,12 +16,6 @@ Python向けの軽量テキストエディター。IDLEより少し高機能で�
 pip install kaku
 ```
 
-Ruff と Ty がコマンドとして利用できる必要があります：
-
-```
-pip install ruff ty
-```
-
 ## 起動
 
 ```

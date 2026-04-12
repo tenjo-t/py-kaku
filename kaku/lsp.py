@@ -158,7 +158,7 @@ class LspClient(QObject):
                         headers[k.strip()] = v.strip()
 
                 length = int(headers.get("Content-Length", 0))
-                if length == 0:
+                if length <= 0 or length > 10 * 1024 * 1024:  # 10 MB上限
                     continue
 
                 body = proc.stdout.read(length)

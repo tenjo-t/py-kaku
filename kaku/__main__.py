@@ -1022,10 +1022,10 @@ class KakuEditor(QMainWindow):
         self._setup_menu()
         self._update_title()
 
-        self._lsp_ruff_active = self._lsp_ruff.start(["ruff", "server"])
+        self._lsp_ruff_active = self._lsp_ruff.start([sys.executable, "-m", "ruff", "server"])
         if self._lsp_ruff_active:
             self._lsp_ruff.initialize()
-        self._lsp_ty_active = self._lsp_ty.start(["ty", "server"])
+        self._lsp_ty_active = self._lsp_ty.start([sys.executable, "-m", "ty", "server"])
         if self._lsp_ty_active:
             self._lsp_ty.initialize()
 
