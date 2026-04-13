@@ -1049,6 +1049,9 @@ class KakuEditor(QMainWindow):
 
         self._status_bar = QStatusBar()
         self.setStatusBar(self._status_bar)
+        self._diag_label = QLabel()
+        self._diag_label.setStyleSheet("QLabel { margin-right: 4px; }")
+        self._status_bar.addPermanentWidget(self._diag_label)
         self._editor.cursorPositionChanged.connect(self._update_cursor_position)
         self._update_cursor_position()
 
@@ -1196,6 +1199,17 @@ class KakuEditor(QMainWindow):
             self._diagnostics_by_source[source] = diagnostics
             merged = self._diagnostics_by_source["ruff"] + self._diagnostics_by_source["ty"]
             self._editor.set_diagnostics(merged)
+            self._update_diag_label(merged)
+
+    def _update_diag_label(self, diagnostics: list) -> None:
+        errors = sum(1 for d in diagnostics if d.get("severity") == 1)
+        warnings = sum(1 for d in diagnostics if d.get("severity") == 2)
+        parts = []
+        if errors:
+            parts.append(f'<span style="color:#d20f39;">✕ {errors}</span>')
+        if warnings:
+            parts.append(f'<span style="color:#df8e1d;">⚠ {warnings}</span>')
+        self._diag_label.setText("  ".join(parts) if parts else "")
 
     def _on_completion_requested(self, line: int, character: int) -> None:
         # 補完前に最新の変更を即座にLSPへ通知（didChangeタイマーを待たない）
@@ -1299,6 +1313,7 @@ class KakuEditor(QMainWindow):
         self._close_lsp_document()
         self._editor.clear()
         self._editor.set_diagnostics([])
+        self._update_diag_label([])
         self._file_path = None
         self._is_modified = False
         self._update_title()
